@@ -1,0 +1,4 @@
+.vscode/settings.json
+models/onnx/*.onnx
+models/tensorrt/*.trt
+*.pyc

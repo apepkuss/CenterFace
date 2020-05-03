@@ -10,18 +10,23 @@ class CenterFace(object):
     def __init__(self, landmarks=True):
         self.landmarks = landmarks
         self.trt_logger = trt.Logger()  # This logger is required to build an engine
-        f = open("../models/tensorrt/centerface.trt", "rb")
         runtime = trt.Runtime(self.trt_logger)
-        self.net = runtime.deserialize_cuda_engine(f.read())
+        with open("models/tensorrt/centerface_fp16_480_640.trt", "rb",) as f:
+            self.net = runtime.deserialize_cuda_engine(f.read())
+            assert self.net is not None, "[ERROR] Failed to deserialize model"
         self.img_h_new, self.img_w_new, self.scale_h, self.scale_w = 0, 0, 0, 0
 
     def __call__(self, img, height, width, threshold=0.5):
         h, w = img.shape[:2]
-        self.img_h_new, self.img_w_new, self.scale_h, self.scale_w = height, width, height / h, width / w
+        self.img_h_new, self.img_w_new, self.scale_h, self.scale_w = (
+            height,
+            width,
+            height / h,
+            width / w,
+        )
         return self.inference_tensorrt(img, threshold)
 
     def inference_tensorrt(self, img, threshold):
-
         class HostDeviceMem(object):
             def __init__(self, host_mem, device_mem):
                 self.host = host_mem
@@ -39,7 +44,10 @@ class CenterFace(object):
             bindings = []
             stream = cuda.Stream()
             for binding in engine:
-                size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+                size = (
+                    trt.volume(engine.get_binding_shape(binding))
+                    * engine.max_batch_size
+                )
                 dtype = trt.nptype(engine.get_binding_dtype(binding))
                 # Allocate host and device buffers
                 host_mem = cuda.pagelocked_empty(size, dtype)
@@ -57,7 +65,9 @@ class CenterFace(object):
             # Transfer data from CPU to the GPU.
             [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
             # Run inference.
-            context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
+            context.execute_async(
+                batch_size=batch_size, bindings=bindings, stream_handle=stream.handle
+            )
             # Transfer predictions back from the GPU.
             [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
             # Synchronize the stream
@@ -66,39 +76,69 @@ class CenterFace(object):
             return [out.host for out in outputs]
 
         image_cv = cv2.resize(img, dsize=(self.img_w_new, self.img_h_new))
-        blob = np.expand_dims(image_cv[:, :, (2, 1, 0)].transpose(2, 0, 1), axis=0).astype("float32")
+        blob = np.expand_dims(
+            image_cv[:, :, (2, 1, 0)].transpose(2, 0, 1), axis=0
+        ).astype("float32")
         engine = self.net
 
         # Create the context for this engine
         context = engine.create_execution_context()
         # Allocate buffers for input and output
-        inputs, outputs, bindings, stream = allocate_buffers(engine)  # input, output: host # bindings
+        inputs, outputs, bindings, stream = allocate_buffers(
+            engine
+        )  # input, output: host # bindings
 
         # Do inference
-        shape_of_output = [(1, 1, int(self.img_h_new / 4), int(self.img_w_new / 4)),
-                           (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
-                           (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
-                           (1, 10, int(self.img_h_new / 4), int(self.img_w_new / 4))]
+        shape_of_output = [
+            (1, 1, int(self.img_h_new / 4), int(self.img_w_new / 4)),
+            (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
+            (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
+            (1, 10, int(self.img_h_new / 4), int(self.img_w_new / 4)),
+        ]
         # Load data to the buffer
         inputs[0].host = blob.reshape(-1)
         begin = datetime.datetime.now()
-        trt_outputs = do_inference(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream)  # numpy data
+        trt_outputs = do_inference(
+            context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream
+        )  # numpy data
         end = datetime.datetime.now()
         print("gpu times = ", end - begin)
 
-        heatmap, scale, offset, lms = [output.reshape(shape) for output, shape in zip(trt_outputs, shape_of_output)]
+        heatmap, scale, offset, lms = [
+            output.reshape(shape) for output, shape in zip(trt_outputs, shape_of_output)
+        ]
         print(heatmap.shape, scale.shape, offset.shape, lms.shape)
         return self.postprocess(heatmap, lms, offset, scale, threshold)
 
     def postprocess(self, heatmap, lms, offset, scale, threshold):
         if self.landmarks:
-            dets, lms = self.decode(heatmap, scale, offset, lms, (self.img_h_new, self.img_w_new), threshold=threshold)
+            dets, lms = self.decode(
+                heatmap,
+                scale,
+                offset,
+                lms,
+                (self.img_h_new, self.img_w_new),
+                threshold=threshold,
+            )
         else:
-            dets = self.decode(heatmap, scale, offset, None, (self.img_h_new, self.img_w_new), threshold=threshold)
+            dets = self.decode(
+                heatmap,
+                scale,
+                offset,
+                None,
+                (self.img_h_new, self.img_w_new),
+                threshold=threshold,
+            )
         if len(dets) > 0:
-            dets[:, 0:4:2], dets[:, 1:4:2] = dets[:, 0:4:2] / self.scale_w, dets[:, 1:4:2] / self.scale_h
+            dets[:, 0:4:2], dets[:, 1:4:2] = (
+                dets[:, 0:4:2] / self.scale_w,
+                dets[:, 1:4:2] / self.scale_h,
+            )
             if self.landmarks:
-                lms[:, 0:10:2], lms[:, 1:10:2] = lms[:, 0:10:2] / self.scale_w, lms[:, 1:10:2] / self.scale_h
+                lms[:, 0:10:2], lms[:, 1:10:2] = (
+                    lms[:, 0:10:2] / self.scale_w,
+                    lms[:, 1:10:2] / self.scale_h,
+                )
         else:
             dets = np.empty(shape=[0, 5], dtype=np.float32)
             if self.landmarks:
@@ -119,10 +159,16 @@ class CenterFace(object):
             boxes = []
         if len(c0) > 0:
             for i in range(len(c0)):
-                s0, s1 = np.exp(scale0[c0[i], c1[i]]) * 4, np.exp(scale1[c0[i], c1[i]]) * 4
+                s0, s1 = (
+                    np.exp(scale0[c0[i], c1[i]]) * 4,
+                    np.exp(scale1[c0[i], c1[i]]) * 4,
+                )
                 o0, o1 = offset0[c0[i], c1[i]], offset1[c0[i], c1[i]]
                 s = heatmap[c0[i], c1[i]]
-                x1, y1 = max(0, (c1[i] + o1 + 0.5) * 4 - s1 / 2), max(0, (c0[i] + o0 + 0.5) * 4 - s0 / 2)
+                x1, y1 = (
+                    max(0, (c1[i] + o1 + 0.5) * 4 - s1 / 2),
+                    max(0, (c0[i] + o0 + 0.5) * 4 - s0 / 2),
+                )
                 x1, y1 = min(x1, size[1]), min(y1, size[0])
                 boxes.append([x1, y1, min(x1 + s1, size[1]), min(y1 + s0, size[0]), s])
                 if self.landmarks:
