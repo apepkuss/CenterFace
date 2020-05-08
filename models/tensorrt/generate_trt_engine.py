@@ -67,15 +67,12 @@ def get_engine(
 
 if __name__ == "__main__":
     onnx_file = Path(
-        "/home/nano/workspace/CenterFace/models/onnx/centerface_480_640.onnx"
+        "/home/nano/workspace/CenterFace/models/onnx/centerface_1080_1920.onnx"
     )
     engine_file = Path(
-        "/home/nano/workspace/CenterFace/models/tensorrt/centerface_fp16_480_640.trt"
+        "/home/nano/workspace/CenterFace/models/tensorrt/centerface_fp32_1080_1920.trt"
     )
     get_engine(
-        onnx_file_path=onnx_file,
-        engine_file_path=engine_file,
-        fp16_mode=True,
-        save_engine=True,
+        onnx_file_path=onnx_file, engine_file_path=engine_file, save_engine=True,
     )
     print("Done.")

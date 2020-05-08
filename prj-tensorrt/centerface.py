@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import datetime
+
 import pycuda.autoinit
 import pycuda.driver as cuda
 import tensorrt as trt
@@ -11,9 +12,23 @@ class CenterFace(object):
         self.landmarks = landmarks
         self.trt_logger = trt.Logger()  # This logger is required to build an engine
         runtime = trt.Runtime(self.trt_logger)
-        with open("models/tensorrt/centerface_fp16_480_640.trt", "rb",) as f:
+        with open(
+            "/home/nano/workspace/CenterFace/models/tensorrt/centerface_fp16_1080_1920.trt",
+            "rb",
+        ) as f:
             self.net = runtime.deserialize_cuda_engine(f.read())
             assert self.net is not None, "[ERROR] Failed to deserialize model"
+
+            # Create the context for this engine
+            self.__context = self.net.create_execution_context()
+            # Allocate buffers for input and output
+            (
+                self.__inputs,
+                self.__outputs,
+                self.__bindings,
+                self.__stream,
+            ) = self.allocate_buffers(self.net)
+
         self.img_h_new, self.img_w_new, self.scale_h, self.scale_w = 0, 0, 0, 0
 
     def __call__(self, img, height, width, threshold=0.5):
@@ -27,68 +42,12 @@ class CenterFace(object):
         return self.inference_tensorrt(img, threshold)
 
     def inference_tensorrt(self, img, threshold):
-        class HostDeviceMem(object):
-            def __init__(self, host_mem, device_mem):
-                self.host = host_mem
-                self.device = device_mem
-
-            def __str__(self):
-                return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
-
-            def __repr__(self):
-                return self.__str__()
-
-        def allocate_buffers(engine):
-            inputs = []
-            outputs = []
-            bindings = []
-            stream = cuda.Stream()
-            for binding in engine:
-                size = (
-                    trt.volume(engine.get_binding_shape(binding))
-                    * engine.max_batch_size
-                )
-                dtype = trt.nptype(engine.get_binding_dtype(binding))
-                # Allocate host and device buffers
-                host_mem = cuda.pagelocked_empty(size, dtype)
-                device_mem = cuda.mem_alloc(host_mem.nbytes)
-                # Append the device buffer to device bindings.
-                bindings.append(int(device_mem))
-                # Append to the appropriate list.
-                if engine.binding_is_input(binding):
-                    inputs.append(HostDeviceMem(host_mem, device_mem))
-                else:
-                    outputs.append(HostDeviceMem(host_mem, device_mem))
-            return inputs, outputs, bindings, stream
-
-        def do_inference(context, bindings, inputs, outputs, stream, batch_size=1):
-            # Transfer data from CPU to the GPU.
-            [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
-            # Run inference.
-            context.execute_async(
-                batch_size=batch_size, bindings=bindings, stream_handle=stream.handle
-            )
-            # Transfer predictions back from the GPU.
-            [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
-            # Synchronize the stream
-            stream.synchronize()
-            # Return only the host outputs.
-            return [out.host for out in outputs]
-
         image_cv = cv2.resize(img, dsize=(self.img_w_new, self.img_h_new))
         blob = np.expand_dims(
             image_cv[:, :, (2, 1, 0)].transpose(2, 0, 1), axis=0
-        ).astype("float32")
-        engine = self.net
+        ).astype(np.float32)
 
-        # Create the context for this engine
-        context = engine.create_execution_context()
-        # Allocate buffers for input and output
-        inputs, outputs, bindings, stream = allocate_buffers(
-            engine
-        )  # input, output: host # bindings
-
-        # Do inference
+        # todo: move to __call__
         shape_of_output = [
             (1, 1, int(self.img_h_new / 4), int(self.img_w_new / 4)),
             (1, 2, int(self.img_h_new / 4), int(self.img_w_new / 4)),
@@ -96,10 +55,16 @@ class CenterFace(object):
             (1, 10, int(self.img_h_new / 4), int(self.img_w_new / 4)),
         ]
         # Load data to the buffer
-        inputs[0].host = blob.reshape(-1)
+        self.__inputs[0].host = blob.reshape(-1)
+
+        # * run inference
         begin = datetime.datetime.now()
-        trt_outputs = do_inference(
-            context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream
+        trt_outputs = self.do_inference(
+            self.__context,
+            bindings=self.__bindings,
+            inputs=self.__inputs,
+            outputs=self.__outputs,
+            stream=self.__stream,
         )  # numpy data
         end = datetime.datetime.now()
         print("gpu times = ", end - begin)
@@ -229,3 +194,49 @@ class CenterFace(object):
                     suppressed[j] = True
 
         return keep
+
+    def allocate_buffers(self, engine):
+        inputs = []
+        outputs = []
+        bindings = []
+        stream = cuda.Stream()
+        for binding in engine:
+            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            # Allocate host and device buffers
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            # Append the device buffer to device bindings.
+            bindings.append(int(device_mem))
+            # Append to the appropriate list.
+            if engine.binding_is_input(binding):
+                inputs.append(HostDeviceMem(host_mem, device_mem))
+            else:
+                outputs.append(HostDeviceMem(host_mem, device_mem))
+        return inputs, outputs, bindings, stream
+
+    def do_inference(self, context, bindings, inputs, outputs, stream, batch_size=1):
+        # Transfer data from CPU to the GPU.
+        [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
+        # Run inference.
+        context.execute_async(
+            batch_size=batch_size, bindings=bindings, stream_handle=stream.handle
+        )
+        # Transfer predictions back from the GPU.
+        [cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
+        # Synchronize the stream
+        stream.synchronize()
+        # Return only the host outputs.
+        return [out.host for out in outputs]
+
+
+class HostDeviceMem(object):
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+
+    def __str__(self):
+        return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
+
+    def __repr__(self):
+        return self.__str__()

@@ -5,7 +5,7 @@ from centerface import CenterFace
 
 
 def test_image_tensorrt():
-    frame = cv2.imread("prj-python/000388.jpg")
+    frame = cv2.imread("/home/nano/workspace/CenterFace/prj-python/000388.jpg")
     # * set height and width
     h, w = 480, 640  # must be 480* 640
     landmarks = False
@@ -38,5 +38,56 @@ def test_image_tensorrt():
     cv2.waitKey(0)
 
 
+def test_cam_tensorrt():
+    uri = "rtsp://192.168.1.89/user=admin&password=&channel=1&stream=0.sdp?"
+    width = 1920
+    height = 1080
+    latency = 20
+    cam = open_gst_camera(uri, width, height, latency)
+    ok, frame = cam.read()
+
+    while ok:
+        landmarks = False
+        centerface = CenterFace(landmarks=landmarks)
+        if landmarks:
+            dets, lms = centerface(frame, 480, 640, threshold=0.35)
+        else:
+            dets = centerface(frame, 480, 640, threshold=0.35)
+        print("count = ", len(dets))
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+
+        ok, frame = cam.read()
+
+
+def open_gst_camera(
+    uri: str, width: int, height: int, latency: int
+) -> cv2.VideoCapture:
+    assert uri is not None, "'uri' should not be None."
+    assert isinstance(uri, str), "'uri' should be of str type."
+    assert width is not None, "'width' should not be None."
+    assert isinstance(width, int), "'width' should be of int type."
+    assert height is not None, "'height' should not be None."
+    assert isinstance(height, int), "'height' should be of int type."
+    assert latency is not None, "'latency' should not be None."
+    assert isinstance(latency, int), "'latency' should be of int type."
+
+    gst_str = (
+        "rtspsrc location={} latency={} ! "
+        "rtph264depay ! h264parse ! omxh264dec ! "
+        "nvvidconv ! "
+        "video/x-raw, width=(int){}, height=(int){}, "
+        "format=(string)BGRx ! "
+        "videoconvert ! appsink"
+    ).format(uri, latency, width, height)
+    print(f"[INFO] gst_str: {gst_str}")
+
+    # create VideoCapture object
+    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+
+
 if __name__ == "__main__":
-    test_image_tensorrt()
+    # test_image_tensorrt()
+    test_cam_tensorrt()
